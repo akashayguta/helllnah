@@ -1,1 +1,1 @@
-web: python working/b2.py
+web: python b2.py
