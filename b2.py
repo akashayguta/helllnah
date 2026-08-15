@@ -111,6 +111,7 @@ def stats_payload():
         requested = _acc_requested
         done = _acc_done
         failed = _acc_failed
+    cooldown, solver_err = solver_in_cooldown()
     return {
         "status": "ok",
         "total_accounts_created": st.get("created_total", 0),
@@ -121,6 +122,8 @@ def stats_payload():
         "expired": st.get("expired_total", 0),
         "failed_total": st.get("failed_total", 0),
         "fail_reasons": st.get("fail_reasons", {}),
+        "solver_ok": not cooldown,
+        "solver_error": solver_err if cooldown else "",
         "session": {"requested": requested, "done": done, "failed": failed},
         "pool_min": MIN_ACCOUNTS,
         "pool_max": MAX_ACCOUNTS,
@@ -278,11 +281,32 @@ def sanitize(msg):
 
 # ─── Cloudflare Turnstile Solver (CaptchaAI) ──────────────────
 
-CAPTCHA_AI_KEY = os.environ.get("CAPTCHA_AI_KEY", "j87puttfpmta1fynqy0iwqjlco34z4yr")
+CAPTCHA_AI_KEY = os.environ.get("CAPTCHA_AI_KEY", "ll9gwrfltxpf1tsoxeojrrm5cojglukc")
+
+# circuit breaker — a dead/broke solver must not death-spiral the refill loop
+_solver_cooldown_until = 0.0
+_solver_lock = threading.Lock()
+_last_solver_error = ""
+
+_FATAL_SOLVER_ERRORS = ("ERROR_ZERO_BALANCE", "ERROR_KEY_DOES_NOT_EXIST",
+                        "ERROR_WRONG_USER_KEY", "ERROR_IP_NOT_ALLOWED")
+
+def _trip_solver_cooldown(err):
+    global _solver_cooldown_until, _last_solver_error
+    with _solver_lock:
+        _last_solver_error = str(err)[:80]
+        _solver_cooldown_until = time.time() + 300     # 5 min hard pause
+
+def solver_in_cooldown():
+    with _solver_lock:
+        return time.time() < _solver_cooldown_until, _last_solver_error
 
 def solve_turnstile(page_url=None, sitekey="0x4AAAAAAA9ogJWz4UGndXNX", max_retry=3, poll_retry=36):
     if not page_url:
         page_url = f"{BASE_URL}/my-account/"
+    cooldown, err = solver_in_cooldown()
+    if cooldown:
+        return None
     in_url = "https://ocr.captchaai.com/in.php"
     res_url = "https://ocr.captchaai.com/res.php"
     for _ in range(max_retry):
@@ -296,6 +320,10 @@ def solve_turnstile(page_url=None, sitekey="0x4AAAAAAA9ogJWz4UGndXNX", max_retry
             }, timeout=30)
             d = r.json()
             if d.get("status") != 1:
+                err = str(d.get("request", ""))
+                if any(f in err for f in _FATAL_SOLVER_ERRORS):
+                    _trip_solver_cooldown(err)          # broke/banned — stop hammering
+                    return None
                 continue
             for _ in range(poll_retry):
                 time.sleep(5)
@@ -507,6 +535,9 @@ _refill_lock = threading.Lock()
 def replace_dead_cookie():
     """A cookie died → replace it exactly 1:1 (2 dead = 2 new), capped at
     MAX_ACCOUNTS. Under the MIN floor the refill-to-MIN covers the loss."""
+    cooldown, _ = solver_in_cooldown()
+    if cooldown:
+        return                                  # solver dead — don't queue doomed work
     with _refill_lock:
         pool = load_pool()
         with _building_lock:
@@ -531,6 +562,9 @@ def maybe_auto_refill():
     total = len(pool) + building
     if len(pool) >= MIN_ACCOUNTS or total >= MAX_ACCOUNTS:
         return
+    cooldown, _ = solver_in_cooldown()
+    if cooldown:
+        return                                  # solver dead — retry after cooldown
     with _refill_lock:
         # re-check under the lock so concurrent deaths only fire one refill
         pool = load_pool()
